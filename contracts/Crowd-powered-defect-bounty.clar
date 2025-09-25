@@ -7,10 +7,13 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u105))
 (define-constant ERR_REPORT_ALREADY_EXISTS (err u106))
 (define-constant ERR_INVALID_STATUS (err u107))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u108))
 
 (define-constant VOTING_PERIOD u144)
 (define-constant MIN_STAKE_AMOUNT u1000000)
 (define-constant REWARD_PERCENTAGE u70)
+(define-constant REPUTATION_THRESHOLD u50)
+(define-constant MAX_REPUTATION_SCORE u100)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-staked uint u0)
@@ -57,6 +60,18 @@
   { member: principal }
   { stake: uint, joined-at: uint })
 
+(define-map reporter-reputation
+  { reporter: principal }
+  {
+    total-reports: uint,
+    approved-reports: uint,
+    rejected-reports: uint,
+    reputation-score: uint,
+    total-rewards: uint,
+    last-updated: uint
+  }
+)
+
 (define-public (register-company (name (string-ascii 64)) (stake-amount uint))
   (let ((company-id (default-to u0 (get count (map-get? company-counter { dummy: true })))))
     (asserts! (>= stake-amount MIN_STAKE_AMOUNT) ERR_INVALID_AMOUNT)
@@ -93,9 +108,11 @@
   (evidence-hash (string-ascii 64))
   (reward-amount uint))
   (let ((report-id (var-get next-report-id))
-        (company-data (unwrap! (map-get? companies { company-id: company-id }) ERR_NOT_FOUND)))
+        (company-data (unwrap! (map-get? companies { company-id: company-id }) ERR_NOT_FOUND))
+        (reporter-rep (get-reporter-reputation tx-sender)))
     (asserts! (get active company-data) ERR_INVALID_STATUS)
     (asserts! (> reward-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get reputation-score reporter-rep) REPUTATION_THRESHOLD) ERR_INSUFFICIENT_REPUTATION)
     (try! (stx-transfer? reward-amount tx-sender (as-contract tx-sender)))
     (map-set defect-reports 
       { report-id: report-id }
@@ -112,6 +129,7 @@
         voting-ends: (+ stacks-block-height VOTING_PERIOD),
         created-at: stacks-block-height
       })
+    (unwrap-panic (update-reporter-stats tx-sender u1 u0 u0))
     (var-set next-report-id (+ report-id u1))
     (var-set dao-treasury (+ (var-get dao-treasury) reward-amount))
     (ok report-id)))
@@ -159,6 +177,7 @@
                   (dao-share (- reward-amount reporter-reward)))
               (try! (as-contract (stx-transfer? reporter-reward tx-sender (get reporter report))))
               (var-set dao-treasury (- (var-get dao-treasury) reporter-reward))
+              (unwrap-panic (update-reporter-stats (get reporter report) u0 u1 reporter-reward))
               (unwrap! (distribute-voter-rewards report-id votes-for total-votes dao-share) ERR_INVALID_AMOUNT)
               (ok true)))
           (begin
@@ -167,6 +186,7 @@
               (merge report { status: "rejected" }))
             (try! (as-contract (stx-transfer? reward-amount tx-sender (get reporter report))))
             (var-set dao-treasury (- (var-get dao-treasury) reward-amount))
+            (unwrap-panic (update-reporter-stats (get reporter report) u0 u0 u1))
             (ok false)))))))
 
 (define-private (distribute-voter-rewards (report-id uint) (winning-votes uint) (total-votes uint) (reward-pool uint))
@@ -221,3 +241,52 @@
 
 (define-read-only (get-company-count)
   (default-to u0 (get count (map-get? company-counter { dummy: true }))))
+
+(define-private (update-reporter-stats (reporter principal) (new-reports uint) (approved uint) (rejected uint))
+  (let ((current-rep (get-reporter-reputation reporter)))
+    (let ((new-total (+ (get total-reports current-rep) new-reports))
+          (new-approved (+ (get approved-reports current-rep) approved))
+          (new-rejected (+ (get rejected-reports current-rep) rejected))
+          (new-score (if (> new-total u0)
+                        (/ (* new-approved u100) new-total)
+                        u100)))
+      (map-set reporter-reputation 
+        { reporter: reporter }
+        {
+          total-reports: new-total,
+          approved-reports: new-approved,
+          rejected-reports: new-rejected,
+          reputation-score: (if (> new-score MAX_REPUTATION_SCORE) MAX_REPUTATION_SCORE new-score),
+          total-rewards: (+ (get total-rewards current-rep) (if (> approved u0) u1 u0)),
+          last-updated: stacks-block-height
+        })
+      (ok true)
+    )
+  )
+)
+
+(define-private (get-reporter-reputation (reporter principal))
+  (default-to 
+    {
+      total-reports: u0,
+      approved-reports: u0,
+      rejected-reports: u0,
+      reputation-score: u100,
+      total-rewards: u0,
+      last-updated: u0
+    }
+    (map-get? reporter-reputation { reporter: reporter })
+  )
+)
+
+(define-read-only (get-reputation (reporter principal))
+  (map-get? reporter-reputation { reporter: reporter })
+)
+
+(define-read-only (get-reputation-score (reporter principal))
+  (get reputation-score (get-reporter-reputation reporter))
+)
+
+(define-read-only (is-eligible-reporter (reporter principal))
+  (>= (get-reputation-score reporter) REPUTATION_THRESHOLD)
+)
