@@ -14,6 +14,8 @@
 (define-constant REWARD_PERCENTAGE u70)
 (define-constant REPUTATION_THRESHOLD u50)
 (define-constant MAX_REPUTATION_SCORE u100)
+(define-constant ESCALATION_FEE_PERCENTAGE u50)
+(define-constant MAX_ESCALATIONS u2)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-staked uint u0)
@@ -71,6 +73,34 @@
     last-updated: uint
   }
 )
+
+(define-map report-escalations
+  { report-id: uint }
+  {
+    escalation-count: uint,
+    current-escalation: uint,
+    last-escalated-at: uint,
+    escalation-fee-paid: uint
+  }
+)
+
+(define-map escalation-details
+  { report-id: uint, escalation-number: uint }
+  {
+    new-evidence-hash: (string-ascii 64),
+    additional-description: (string-ascii 256),
+    votes-for: uint,
+    votes-against: uint,
+    voting-ends: uint,
+    status: (string-ascii 16),
+    escalated-by: principal,
+    created-at: uint
+  }
+)
+
+(define-map escalation-voter-records
+  { report-id: uint, escalation-number: uint, voter: principal }
+  { vote: bool, stake: uint })
 
 (define-public (register-company (name (string-ascii 64)) (stake-amount uint))
   (let ((company-id (default-to u0 (get count (map-get? company-counter { dummy: true })))))
@@ -290,3 +320,130 @@
 (define-read-only (is-eligible-reporter (reporter principal))
   (>= (get-reputation-score reporter) REPUTATION_THRESHOLD)
 )
+
+(define-public (escalate-report
+  (report-id uint)
+  (new-evidence-hash (string-ascii 64))
+  (additional-description (string-ascii 256)))
+  (let ((report (unwrap! (map-get? defect-reports { report-id: report-id }) ERR_NOT_FOUND))
+        (escalation-data (default-to 
+          { escalation-count: u0, current-escalation: u0, last-escalated-at: u0, escalation-fee-paid: u0 }
+          (map-get? report-escalations { report-id: report-id })))
+        (escalation-fee (/ (* (get reward-amount report) ESCALATION_FEE_PERCENTAGE) u100)))
+    (begin
+      (asserts! (is-eq (get reporter report) tx-sender) ERR_UNAUTHORIZED)
+      (asserts! (is-eq (get status report) "rejected") ERR_INVALID_STATUS)
+      (asserts! (< (get escalation-count escalation-data) MAX_ESCALATIONS) ERR_INVALID_STATUS)
+      (asserts! (> escalation-fee u0) ERR_INVALID_AMOUNT)
+      (try! (stx-transfer? escalation-fee tx-sender (as-contract tx-sender)))
+      (let ((new-escalation-number (+ (get escalation-count escalation-data) u1)))
+        (map-set report-escalations
+          { report-id: report-id }
+          {
+            escalation-count: new-escalation-number,
+            current-escalation: new-escalation-number,
+            last-escalated-at: stacks-block-height,
+            escalation-fee-paid: (+ (get escalation-fee-paid escalation-data) escalation-fee)
+          })
+        (map-set escalation-details
+          { report-id: report-id, escalation-number: new-escalation-number }
+          {
+            new-evidence-hash: new-evidence-hash,
+            additional-description: additional-description,
+            votes-for: u0,
+            votes-against: u0,
+            voting-ends: (+ stacks-block-height VOTING_PERIOD),
+            status: "pending",
+            escalated-by: tx-sender,
+            created-at: stacks-block-height
+          })
+        (var-set dao-treasury (+ (var-get dao-treasury) escalation-fee))
+        (ok new-escalation-number)))))
+
+(define-public (vote-on-escalation (report-id uint) (escalation-number uint) (vote-for bool))
+  (let ((escalation (unwrap! (map-get? escalation-details 
+                               { report-id: report-id, escalation-number: escalation-number }) ERR_NOT_FOUND))
+        (voter-stake (default-to u0 (get stake (map-get? dao-members { member: tx-sender }))))
+        (existing-vote (map-get? escalation-voter-records 
+                        { report-id: report-id, escalation-number: escalation-number, voter: tx-sender })))
+    (begin
+      (asserts! (> voter-stake u0) ERR_UNAUTHORIZED)
+      (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+      (asserts! (<= stacks-block-height (get voting-ends escalation)) ERR_VOTING_CLOSED)
+      (asserts! (is-eq (get status escalation) "pending") ERR_INVALID_STATUS)
+      (map-set escalation-voter-records
+        { report-id: report-id, escalation-number: escalation-number, voter: tx-sender }
+        { vote: vote-for, stake: voter-stake })
+      (if vote-for
+        (map-set escalation-details
+          { report-id: report-id, escalation-number: escalation-number }
+          (merge escalation { votes-for: (+ (get votes-for escalation) voter-stake) }))
+        (map-set escalation-details
+          { report-id: report-id, escalation-number: escalation-number }
+          (merge escalation { votes-against: (+ (get votes-against escalation) voter-stake) })))
+      (ok true))))
+
+(define-public (finalize-escalation (report-id uint) (escalation-number uint))
+  (let ((escalation (unwrap! (map-get? escalation-details 
+                               { report-id: report-id, escalation-number: escalation-number }) ERR_NOT_FOUND))
+        (report (unwrap! (map-get? defect-reports { report-id: report-id }) ERR_NOT_FOUND)))
+    (begin
+      (asserts! (> stacks-block-height (get voting-ends escalation)) ERR_VOTING_CLOSED)
+      (asserts! (is-eq (get status escalation) "pending") ERR_INVALID_STATUS)
+      (let ((votes-for (get votes-for escalation))
+            (votes-against (get votes-against escalation))
+            (total-votes (+ votes-for votes-against))
+            (approved (and (> total-votes u0) (> votes-for votes-against)))
+            (reward-amount (get reward-amount report)))
+        (if approved
+          (begin
+            (map-set escalation-details
+              { report-id: report-id, escalation-number: escalation-number }
+              (merge escalation { status: "approved" }))
+            (map-set defect-reports
+              { report-id: report-id }
+              (merge report { status: "approved" }))
+            (let ((reporter-reward (/ (* reward-amount REWARD_PERCENTAGE) u100))
+                  (dao-share (- reward-amount reporter-reward)))
+              (try! (as-contract (stx-transfer? reporter-reward tx-sender (get reporter report))))
+              (var-set dao-treasury (- (var-get dao-treasury) reporter-reward))
+              (unwrap-panic (update-reporter-stats (get reporter report) u0 u1 u0))
+              (ok true)))
+          (begin
+            (map-set escalation-details
+              { report-id: report-id, escalation-number: escalation-number }
+              (merge escalation { status: "rejected" }))
+            (ok false)))))))
+
+(define-read-only (get-escalation-status (report-id uint))
+  (map-get? report-escalations { report-id: report-id }))
+
+(define-read-only (get-escalation-details (report-id uint) (escalation-number uint))
+  (map-get? escalation-details { report-id: report-id, escalation-number: escalation-number }))
+
+(define-read-only (get-escalation-voter-record (report-id uint) (escalation-number uint) (voter principal))
+  (map-get? escalation-voter-records { report-id: report-id, escalation-number: escalation-number, voter: voter }))
+
+(define-read-only (is-escalation-voting-active (report-id uint) (escalation-number uint))
+  (match (map-get? escalation-details { report-id: report-id, escalation-number: escalation-number })
+    escalation (and 
+                (is-eq (get status escalation) "pending")
+                (<= stacks-block-height (get voting-ends escalation)))
+    false))
+
+(define-read-only (calculate-escalation-fee (report-id uint))
+  (match (map-get? defect-reports { report-id: report-id })
+    report (ok (/ (* (get reward-amount report) ESCALATION_FEE_PERCENTAGE) u100))
+    ERR_NOT_FOUND))
+
+(define-read-only (can-escalate-report (report-id uint) (reporter principal))
+  (match (map-get? defect-reports { report-id: report-id })
+    report
+    (let ((escalation-data (default-to 
+            { escalation-count: u0, current-escalation: u0, last-escalated-at: u0, escalation-fee-paid: u0 }
+            (map-get? report-escalations { report-id: report-id }))))
+      (and
+        (is-eq (get reporter report) reporter)
+        (is-eq (get status report) "rejected")
+        (< (get escalation-count escalation-data) MAX_ESCALATIONS)))
+    false))
